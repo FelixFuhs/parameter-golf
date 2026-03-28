@@ -13,3 +13,10 @@
 - **Expectation:** Should match or be close to the official 1.2244 bpb baseline (which uses 8×H100).
 - **Result:** Val bpb 1.3434 (pre-stop), 1.3448 (quantized roundtrip). Artifact size 12.8 MB. 1129 steps in ~10 min. Cost: $0.78.
 - **Learning:** 1×H100 gives ~0.1 bpb worse than the 8×H100 baseline (1.2244), likely because fewer steps complete in the same wall-clock time with less parallelism. ~3.2 MB of headroom under the 16 MB cap. Loss curve nearly flat after step 400 — gains need to come from architecture, not just more steps.
+
+## #2 — Width Bump to 560 (Planned)
+- **Change:** Increase `MODEL_DIM` from `512` to `560` and keep the rest of the baseline recipe unchanged.
+- **Hypothesis:** A single width bump should use much more of the 16 MB budget and improve validation bpb without adding extra recipe complexity.
+- **Expectation:** Estimated total compressed submission size of about `15.27 MB`, still safely under the cap.
+- **Result:** Pending.
+- **Learning:** Pending.
