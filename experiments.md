@@ -14,9 +14,16 @@
 - **Result:** Val bpb 1.3434 (pre-stop), 1.3448 (quantized roundtrip). Artifact size 12.8 MB. 1129 steps in ~10 min. Cost: $0.78.
 - **Learning:** 1×H100 gives ~0.1 bpb worse than the 8×H100 baseline (1.2244), likely because fewer steps complete in the same wall-clock time with less parallelism. ~3.2 MB of headroom under the 16 MB cap. Loss curve nearly flat after step 400 — gains need to come from architecture, not just more steps.
 
-## #2 — Width Bump to 560 (Planned)
+## #2 — Width Bump to 560
 - **Change:** Increase `MODEL_DIM` from `512` to `560` and keep the rest of the baseline recipe unchanged.
 - **Hypothesis:** A single width bump should use much more of the 16 MB budget and improve validation bpb without adding extra recipe complexity.
 - **Expectation:** Estimated total compressed submission size of about `15.27 MB`, still safely under the cap.
-- **Result:** Pending.
-- **Learning:** Pending.
+- **Result:** Val bpb `1.3387` (pre-stop), `1.3402` (quantized roundtrip). Artifact size `15.09 MB`. Total compressed submission `15.13 MB`. `1115` steps in ~10 min.
+- **Learning:** This was the best result so far and used the size budget efficiently while changing only one knob. Spending the extra budget on width beat both the baseline and the deeper `10x528` variant.
+
+## #3 — Deeper 10L + Dim 528
+- **Change:** Increase `NUM_LAYERS` from `9` to `10` and `MODEL_DIM` from `512` to `528`, keeping the rest of the baseline recipe unchanged.
+- **Hypothesis:** A modest depth increase plus a smaller width bump might outperform the pure-width run at similar size.
+- **Expectation:** Estimated total compressed submission size of about `15.08 MB`, still under the cap.
+- **Result:** Val bpb `1.3408` (pre-stop), `1.3423` (quantized roundtrip). Artifact size `14.63 MB`. Total compressed submission `14.68 MB`. `1048` steps in ~10 min.
+- **Learning:** This improved over the baseline but underperformed the simpler `MODEL_DIM=560` run. In this 10-minute budget, extra width appears more valuable than a small depth increase at a comparable compressed size.
