@@ -34,3 +34,17 @@
 - **Expectation:** Stay close to the baseline compressed size while matching or slightly beating baseline validation bpb.
 - **Result:** Val bpb `1.3434` (pre-stop), `1.3450` (quantized roundtrip). Artifact size `12.60 MB`. Total compressed submission `12.64 MB`. `1068` steps in ~10 min.
 - **Learning:** At baseline-size budget, the SwiGLU swap did not outperform the original `relu^2` FFN and landed essentially tied or slightly worse than the baseline. Under this short training budget, extra width still looks like the stronger direction.
+
+## #5 — BigramHash Additive (4096 buckets)
+- **Change:** Enable `USE_BIGRAM_HASH=1` with a `4096`-bucket projected BigramHash injected at layer `1`, with no learned gate.
+- **Hypothesis:** Cheap local bigram context should improve compression more efficiently than spending the same bytes on deeper or wider fully-neural capacity.
+- **Expectation:** Estimated total compressed submission around `13.31 MB`, safely under the cap with a real quality gain over baseline.
+- **Result:** Val bpb `1.3364` (pre-stop), `1.3376` (quantized roundtrip). Artifact size `13.81 MB`. Total compressed submission `13.86 MB`. `1217` steps in ~10 min.
+- **Learning:** This was the best run so far. A simple additive BigramHash clearly outperformed baseline, SwiGLU, and the width/depth-only variants while still leaving more than `2 MB` under the size cap.
+
+## #6 — BigramHash Gated (4096 buckets)
+- **Change:** Enable `USE_BIGRAM_HASH=2` with the same `4096`-bucket BigramHash at layer `1`, but multiply the injected feature by a learned sigmoid gate for that layer.
+- **Hypothesis:** A learned gate might suppress noisy bigram features early and improve on the plain additive version.
+- **Expectation:** Similar size to the additive run, with a small chance of better final validation bpb.
+- **Result:** Val bpb `1.3411` (pre-stop), `1.3424` (quantized roundtrip). Artifact size `13.53 MB`. Total compressed submission `13.58 MB`. `1150` steps in ~10 min.
+- **Learning:** The gate did not help here. It trained a bit slower, finished with worse bpb than the plain additive BigramHash, and gave back most of the gain. For this baseline-sized 1×H100 setup, the simpler ungated injection looks decisively better.
