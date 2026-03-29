@@ -27,3 +27,10 @@
 - **Expectation:** Estimated total compressed submission size of about `15.08 MB`, still under the cap.
 - **Result:** Val bpb `1.3408` (pre-stop), `1.3423` (quantized roundtrip). Artifact size `14.63 MB`. Total compressed submission `14.68 MB`. `1048` steps in ~10 min.
 - **Learning:** This improved over the baseline but underperformed the simpler `MODEL_DIM=560` run. In this 10-minute budget, extra width appears more valuable than a small depth increase at a comparable compressed size.
+
+## #4 — SwiGLU Baseline-Size FFN
+- **Change:** Enable `USE_SWIGLU=1`, adding a gated projection to the MLP while automatically shrinking hidden size to `2/3` of the baseline FFN width to keep size nearly constant.
+- **Hypothesis:** SwiGLU could improve quality at roughly the same compressed artifact size by using a stronger MLP nonlinearity instead of spending budget on more parameters.
+- **Expectation:** Stay close to the baseline compressed size while matching or slightly beating baseline validation bpb.
+- **Result:** Val bpb `1.3434` (pre-stop), `1.3450` (quantized roundtrip). Artifact size `12.60 MB`. Total compressed submission `12.64 MB`. `1068` steps in ~10 min.
+- **Learning:** At baseline-size budget, the SwiGLU swap did not outperform the original `relu^2` FFN and landed essentially tied or slightly worse than the baseline. Under this short training budget, extra width still looks like the stronger direction.
