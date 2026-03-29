@@ -48,3 +48,24 @@
 - **Expectation:** Similar size to the additive run, with a small chance of better final validation bpb.
 - **Result:** Val bpb `1.3411` (pre-stop), `1.3424` (quantized roundtrip). Artifact size `13.53 MB`. Total compressed submission `13.58 MB`. `1150` steps in ~10 min.
 - **Learning:** The gate did not help here. It trained a bit slower, finished with worse bpb than the plain additive BigramHash, and gave back most of the gain. For this baseline-sized 1×H100 setup, the simpler ungated injection looks decisively better.
+
+## #7 — BigramHash 12288 (Table-Only Scale-Up)
+- **Change:** Keep the baseline `512`-dim model and scale the additive BigramHash table from `4096` to `12288` buckets.
+- **Hypothesis:** If BigramHash is the strongest signal so far, simply giving it more capacity may beat mixing that budget back into the neural model.
+- **Expectation:** Estimated total compressed submission of about `15.54 MB`, still under the cap and potentially the strongest next move.
+- **Result:** Val bpb `1.3187` (pre-stop), `1.3197` (quantized roundtrip). Artifact size `15.28 MB`. Total compressed submission `15.33 MB`. `1365` steps in ~10 min.
+- **Learning:** This is the new best run by a clear margin. On the 1×H100 budget, more BigramHash capacity beat every previous model-only or mixed model+bigram variant while still staying comfortably under the size cap.
+
+## #8 — BigramHash 4096 + Width 544
+- **Change:** Keep additive BigramHash at `4096` buckets and increase `MODEL_DIM` from `512` to `544`.
+- **Hypothesis:** Combining the two strongest positive signals so far, width and BigramHash, might outperform table-only scaling.
+- **Expectation:** Estimated total compressed submission of about `15.29 MB`, close to the cap but still safe.
+- **Result:** Val bpb `1.3299` (pre-stop), `1.3313` (quantized roundtrip). Artifact size `15.26 MB`. Total compressed submission `15.31 MB`. `1227` steps in ~10 min.
+- **Learning:** This was strong, but still clearly worse than the larger `12288`-bucket table. Once BigramHash is in the model, extra width helps less than simply enlarging the hashed n-gram memory.
+
+## #9 — BigramHash 8192 + Width 528
+- **Change:** Use additive BigramHash with `8192` buckets and a smaller width bump to `MODEL_DIM=528`.
+- **Hypothesis:** A balanced split between more BigramHash capacity and a modest neural width increase might outperform both extremes.
+- **Expectation:** Estimated total compressed submission of about `15.35 MB`, still under the cap.
+- **Result:** Val bpb `1.3341` (pre-stop), `1.3353` (quantized roundtrip). Artifact size `14.84 MB`. Total compressed submission `14.89 MB`. `1181` steps in ~10 min.
+- **Learning:** The balanced middle ground did not win. It beat the older width-only and baseline-size runs, but both the simple `4096` BigramHash and especially the `12288` table-only scale-up were better.
