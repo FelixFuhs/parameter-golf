@@ -66,6 +66,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -605,14 +606,22 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, use_swiglu: bool):
         super().__init__()
         hidden = mlp_mult * dim
+        self.use_swiglu = use_swiglu
+        if self.use_swiglu:
+            hidden = (2 * hidden) // 3
         self.fc = CastedLinear(dim, hidden, bias=False)
+        self.fc_gate = CastedLinear(dim, hidden, bias=False) if self.use_swiglu else None
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.use_swiglu:
+            assert self.fc_gate is not None
+            x = F.silu(self.fc_gate(x)) * self.fc(x)
+            return self.proj(x)
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
@@ -624,6 +633,7 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        use_swiglu: bool,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -631,7 +641,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, use_swiglu)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -654,6 +664,7 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        use_swiglu: bool,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -678,6 +689,7 @@ class GPT(nn.Module):
                     num_heads,
                     num_kv_heads,
                     mlp_mult,
+                    use_swiglu,
                     rope_base,
                     qk_gain_init,
                 )
@@ -830,6 +842,7 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        use_swiglu=args.use_swiglu,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
