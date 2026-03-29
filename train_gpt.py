@@ -67,6 +67,9 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
+    use_bigram_hash = int(os.environ.get("USE_BIGRAM_HASH", "0"))
+    bigram_table_size = int(os.environ.get("BIGRAM_TABLE_SIZE", 4096))
+    bigram_inject_layer = int(os.environ.get("BIGRAM_INJECT_LAYER", 1))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -290,7 +293,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,bigram_gate,bigram_gates",
     ).split(",")
     if pattern
 )
@@ -626,6 +629,38 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class BigramHash(nn.Module):
+    # Top leaderboard variants usually keep a small projected bigram table (often 128d)
+    # and inject it into the residual stream before or early in the transformer.
+    def __init__(self, table_size: int, model_dim: int):
+        super().__init__()
+        if table_size < 2:
+            raise ValueError(f"bigram table_size must be at least 2, got {table_size}")
+        self.table_size = table_size
+        self.hash_dim = min(128, model_dim)
+        self.table = nn.Embedding(table_size, self.hash_dim)
+        self.proj = CastedLinear(self.hash_dim, model_dim, bias=False) if self.hash_dim != model_dim else None
+        if self.proj is not None:
+            self.proj._zero_init = True
+        nn.init.normal_(self.table.weight, mean=0.0, std=0.01)
+
+    def hash_ids(self, token_ids: Tensor) -> Tensor:
+        # Reserve the final bucket for the first position, then hash (prev, cur) pairs
+        # with the xor-style mixer used in several strong leaderboard entries.
+        t = token_ids.to(torch.int32)
+        mod = self.table_size - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.table(self.hash_ids(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -665,6 +700,9 @@ class GPT(nn.Module):
         num_kv_heads: int,
         mlp_mult: int,
         use_swiglu: bool,
+        use_bigram_hash: int,
+        bigram_table_size: int,
+        bigram_inject_layer: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -674,10 +712,24 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if use_bigram_hash not in (0, 1, 2):
+            raise ValueError(f"USE_BIGRAM_HASH must be 0, 1, or 2, got {use_bigram_hash}")
+        if use_bigram_hash and not (0 <= bigram_inject_layer < num_layers):
+            raise ValueError(
+                f"BIGRAM_INJECT_LAYER must be in [0, {num_layers - 1}] when enabled, got {bigram_inject_layer}"
+            )
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.use_bigram_hash = use_bigram_hash
+        self.bigram_inject_layer = bigram_inject_layer
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram = BigramHash(bigram_table_size, model_dim) if use_bigram_hash else None
+        self.bigram_gates = (
+            nn.Parameter(torch.full((num_layers,), -3.0, dtype=torch.float32))
+            if use_bigram_hash == 2
+            else None
+        )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -709,20 +761,35 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def inject_bigram(self, x: Tensor, bigram_out: Tensor | None, layer_idx: int) -> Tensor:
+        if bigram_out is None or layer_idx != self.bigram_inject_layer:
+            return x
+        if self.bigram_gates is not None:
+            gate = torch.sigmoid(self.bigram_gates[layer_idx]).to(dtype=x.dtype)
+            return x + gate * bigram_out
+        return x + bigram_out
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        bigram_out = self.bigram(input_ids) if self.bigram is not None else None
+        if self.bigram_inject_layer == 0:
+            x = self.inject_bigram(x, bigram_out, 0)
         x0 = x
         skips: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
+            if i != 0:
+                x = self.inject_bigram(x, bigram_out, i)
             x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
+            block_idx = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.inject_bigram(x, bigram_out, block_idx)
+            x = self.blocks[block_idx](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -843,6 +910,9 @@ def main() -> None:
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
         use_swiglu=args.use_swiglu,
+        use_bigram_hash=args.use_bigram_hash,
+        bigram_table_size=args.bigram_table_size,
+        bigram_inject_layer=args.bigram_inject_layer,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -874,9 +944,16 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    token_params = [base_model.tok_emb.weight]
+    if base_model.bigram is not None:
+        token_params.append(base_model.bigram.table.weight)
+        if base_model.bigram.proj is not None:
+            matrix_params.append(base_model.bigram.proj.weight)
+        if base_model.bigram_gates is not None:
+            scalar_params.append(base_model.bigram_gates)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": token_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -910,6 +987,12 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    if args.use_bigram_hash:
+        mode = "gated" if args.use_bigram_hash == 2 else "additive"
+        log0(
+            f"bigram_hash:mode={mode} table_size:{args.bigram_table_size} "
+            f"inject_layer:{args.bigram_inject_layer} hash_dim:{base_model.bigram.hash_dim if base_model.bigram is not None else 0}"
+        )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
