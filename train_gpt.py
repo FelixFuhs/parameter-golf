@@ -70,6 +70,11 @@ class Hyperparameters:
     use_bigram_hash = int(os.environ.get("USE_BIGRAM_HASH", "0"))
     bigram_table_size = int(os.environ.get("BIGRAM_TABLE_SIZE", 4096))
     bigram_inject_layer = int(os.environ.get("BIGRAM_INJECT_LAYER", 1))
+    use_bigram_logit_bias = bool(int(os.environ.get("USE_BIGRAM_LOGIT_BIAS", "0")))
+    bigram_logit_alpha_init = float(os.environ.get("BIGRAM_LOGIT_ALPHA_INIT", 0.5))
+    use_byte_features = bool(int(os.environ.get("USE_BYTE_FEATURES", "0")))
+    byte_feature_dim = int(os.environ.get("BYTE_FEATURE_DIM", 32))
+    byte_feature_max_len = int(os.environ.get("BYTE_FEATURE_MAX_LEN", 20))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -208,6 +213,74 @@ def build_sentencepiece_luts(
     )
 
 
+def build_sentencepiece_byte_feature_luts(
+    sp: spm.SentencePieceProcessor, vocab_size: int, max_len: int
+) -> tuple[Tensor, Tensor, Tensor]:
+    if max_len <= 0:
+        raise ValueError(f"BYTE_FEATURE_MAX_LEN must be positive, got {max_len}")
+    sp_vocab_size = int(sp.vocab_size())
+    table_size = max(sp_vocab_size, vocab_size)
+    first_byte_np = np.zeros((table_size,), dtype=np.int64)
+    last_byte_np = np.zeros((table_size,), dtype=np.int64)
+    token_len_np = np.zeros((table_size,), dtype=np.int64)
+    for token_id in range(sp_vocab_size):
+        if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
+            continue
+        if sp.is_byte(token_id):
+            piece = sp.id_to_piece(token_id)
+            if piece.startswith("<0x") and piece.endswith(">") and len(piece) == 6:
+                piece_bytes = bytes((int(piece[3:5], 16),))
+            else:
+                piece_bytes = b""
+        else:
+            piece = sp.id_to_piece(token_id)
+            if piece.startswith("▁"):
+                piece = " " + piece[1:]
+            piece_bytes = piece.encode("utf-8")
+        if piece_bytes:
+            first_byte_np[token_id] = piece_bytes[0]
+            last_byte_np[token_id] = piece_bytes[-1]
+            token_len_np[token_id] = min(len(piece_bytes), max_len)
+    return (
+        torch.tensor(first_byte_np, dtype=torch.int64),
+        torch.tensor(last_byte_np, dtype=torch.int64),
+        torch.tensor(token_len_np, dtype=torch.int64),
+    )
+
+
+def build_bigram_logit_bias(pattern: str, vocab_size: int) -> tuple[Tensor, dict[str, float | int]]:
+    files = [Path(p) for p in sorted(glob.glob(pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {pattern}")
+    smoothing = 0.1
+    counts = np.zeros((vocab_size, vocab_size), dtype=np.uint32)
+    prev_last: int | None = None
+    num_pairs = 0
+    t0 = time.perf_counter()
+    for file in files:
+        tokens_np = load_data_shard(file).numpy().astype(np.int32, copy=False)
+        if tokens_np.size == 0:
+            continue
+        if prev_last is not None:
+            counts[prev_last, int(tokens_np[0])] += 1
+            num_pairs += 1
+        if tokens_np.size >= 2:
+            pair_ids = tokens_np[:-1] * vocab_size + tokens_np[1:]
+            bincount = np.bincount(pair_ids, minlength=vocab_size * vocab_size)
+            counts += bincount.reshape(vocab_size, vocab_size).astype(np.uint32, copy=False)
+            num_pairs += int(tokens_np.size - 1)
+        prev_last = int(tokens_np[-1])
+    row_sum = counts.sum(axis=1, keepdims=True, dtype=np.float64)
+    logp = np.log(counts.astype(np.float64) + smoothing) - np.log(row_sum + smoothing * vocab_size)
+    logp -= logp.mean(axis=1, keepdims=True)
+    stats: dict[str, float | int] = {
+        "elapsed_ms": 1000.0 * (time.perf_counter() - t0),
+        "num_pairs": num_pairs,
+        "nonzero_entries": int(np.count_nonzero(counts)),
+    }
+    return torch.tensor(logp, dtype=torch.float32), stats
+
+
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
@@ -293,7 +366,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,bigram_gate,bigram_gates",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,bigram_gate,bigram_gates,bigram_logit_alpha",
     ).split(",")
     if pattern
 )
@@ -661,6 +734,39 @@ class BigramHash(nn.Module):
         return h
 
 
+class ByteFeatures(nn.Module):
+    def __init__(
+        self,
+        model_dim: int,
+        feature_dim: int,
+        first_byte_lut: Tensor,
+        last_byte_lut: Tensor,
+        token_len_lut: Tensor,
+        max_len: int,
+    ):
+        super().__init__()
+        if feature_dim <= 0:
+            raise ValueError(f"BYTE_FEATURE_DIM must be positive, got {feature_dim}")
+        self.max_len = max_len
+        self.register_buffer("first_byte_lut", first_byte_lut.to(dtype=torch.int64), persistent=False)
+        self.register_buffer("last_byte_lut", last_byte_lut.to(dtype=torch.int64), persistent=False)
+        self.register_buffer("token_len_lut", token_len_lut.to(dtype=torch.int64), persistent=False)
+        self.first_emb = nn.Embedding(256, feature_dim)
+        self.last_emb = nn.Embedding(256, feature_dim)
+        self.len_emb = nn.Embedding(max_len + 1, feature_dim)
+        self.proj = CastedLinear(feature_dim, model_dim, bias=False)
+        self.proj._zero_init = True
+        nn.init.normal_(self.first_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.last_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.len_emb.weight, mean=0.0, std=0.02)
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        first = self.first_emb(self.first_byte_lut[token_ids])
+        last = self.last_emb(self.last_byte_lut[token_ids])
+        token_len = self.len_emb(self.token_len_lut[token_ids].clamp_max(self.max_len))
+        return self.proj(first + last + token_len)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -703,6 +809,15 @@ class GPT(nn.Module):
         use_bigram_hash: int,
         bigram_table_size: int,
         bigram_inject_layer: int,
+        use_bigram_logit_bias: bool,
+        bigram_logit_alpha_init: float,
+        bigram_logit_bias: Tensor | None,
+        use_byte_features: bool,
+        byte_feature_dim: int,
+        byte_feature_first_lut: Tensor | None,
+        byte_feature_last_lut: Tensor | None,
+        byte_feature_len_lut: Tensor | None,
+        byte_feature_max_len: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -718,6 +833,12 @@ class GPT(nn.Module):
             raise ValueError(
                 f"BIGRAM_INJECT_LAYER must be in [0, {num_layers - 1}] when enabled, got {bigram_inject_layer}"
             )
+        if use_bigram_logit_bias and bigram_logit_bias is None:
+            raise ValueError("bigram_logit_bias tensor is required when USE_BIGRAM_LOGIT_BIAS=1")
+        if use_byte_features and (
+            byte_feature_first_lut is None or byte_feature_last_lut is None or byte_feature_len_lut is None
+        ):
+            raise ValueError("byte feature LUTs are required when USE_BYTE_FEATURES=1")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -725,11 +846,32 @@ class GPT(nn.Module):
         self.bigram_inject_layer = bigram_inject_layer
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHash(bigram_table_size, model_dim) if use_bigram_hash else None
+        self.byte_features = (
+            ByteFeatures(
+                model_dim,
+                byte_feature_dim,
+                byte_feature_first_lut,
+                byte_feature_last_lut,
+                byte_feature_len_lut,
+                byte_feature_max_len,
+            )
+            if use_byte_features
+            else None
+        )
         self.bigram_gates = (
             nn.Parameter(torch.full((num_layers,), -3.0, dtype=torch.float32))
             if use_bigram_hash == 2
             else None
         )
+        self.bigram_logit_alpha = (
+            nn.Parameter(torch.tensor(bigram_logit_alpha_init, dtype=torch.float32))
+            if use_bigram_logit_bias
+            else None
+        )
+        if bigram_logit_bias is not None:
+            self.register_buffer("bigram_logit_bias", bigram_logit_bias.contiguous())
+        else:
+            self.bigram_logit_bias = None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -771,6 +913,8 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.byte_features is not None:
+            x = x + self.byte_features(input_ids).to(dtype=x.dtype)
         x = F.rms_norm(x, (x.size(-1),))
         bigram_out = self.bigram(input_ids) if self.bigram is not None else None
         if self.bigram_inject_layer == 0:
@@ -799,6 +943,9 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
+        if self.bigram_logit_bias is not None and self.bigram_logit_alpha is not None:
+            bias = self.bigram_logit_bias[input_ids.reshape(-1)].to(dtype=logits_proj.dtype)
+            logits_proj = logits_proj + self.bigram_logit_alpha.to(dtype=logits_proj.dtype) * bias
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
@@ -894,6 +1041,17 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
+    byte_feature_first_lut = None
+    byte_feature_last_lut = None
+    byte_feature_len_lut = None
+    if args.use_byte_features:
+        byte_feature_first_lut, byte_feature_last_lut, byte_feature_len_lut = build_sentencepiece_byte_feature_luts(
+            sp, args.vocab_size, args.byte_feature_max_len
+        )
+    bigram_logit_bias = None
+    bigram_logit_stats: dict[str, float | int] = {"elapsed_ms": 0.0, "num_pairs": 0, "nonzero_entries": 0}
+    if args.use_bigram_logit_bias:
+        bigram_logit_bias, bigram_logit_stats = build_bigram_logit_bias(args.train_files, args.vocab_size)
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -913,6 +1071,15 @@ def main() -> None:
         use_bigram_hash=args.use_bigram_hash,
         bigram_table_size=args.bigram_table_size,
         bigram_inject_layer=args.bigram_inject_layer,
+        use_bigram_logit_bias=args.use_bigram_logit_bias,
+        bigram_logit_alpha_init=args.bigram_logit_alpha_init,
+        bigram_logit_bias=bigram_logit_bias,
+        use_byte_features=args.use_byte_features,
+        byte_feature_dim=args.byte_feature_dim,
+        byte_feature_first_lut=byte_feature_first_lut,
+        byte_feature_last_lut=byte_feature_last_lut,
+        byte_feature_len_lut=byte_feature_len_lut,
+        byte_feature_max_len=args.byte_feature_max_len,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -951,6 +1118,17 @@ def main() -> None:
             matrix_params.append(base_model.bigram.proj.weight)
         if base_model.bigram_gates is not None:
             scalar_params.append(base_model.bigram_gates)
+    if base_model.bigram_logit_alpha is not None:
+        scalar_params.append(base_model.bigram_logit_alpha)
+    if base_model.byte_features is not None:
+        token_params.extend(
+            [
+                base_model.byte_features.first_emb.weight,
+                base_model.byte_features.last_emb.weight,
+                base_model.byte_features.len_emb.weight,
+            ]
+        )
+        matrix_params.append(base_model.byte_features.proj.weight)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": token_params, "lr": token_lr, "base_lr": token_lr}],
@@ -993,6 +1171,14 @@ def main() -> None:
             f"bigram_hash:mode={mode} table_size:{args.bigram_table_size} "
             f"inject_layer:{args.bigram_inject_layer} hash_dim:{base_model.bigram.hash_dim if base_model.bigram is not None else 0}"
         )
+    if args.use_bigram_logit_bias:
+        log0(
+            f"bigram_logit_bias:enabled alpha_init:{args.bigram_logit_alpha_init} "
+            f"count_time:{bigram_logit_stats['elapsed_ms']:.0f}ms pairs:{bigram_logit_stats['num_pairs']} "
+            f"nonzero_entries:{bigram_logit_stats['nonzero_entries']}"
+        )
+    if args.use_byte_features:
+        log0(f"byte_features:enabled dim:{args.byte_feature_dim} max_len:{args.byte_feature_max_len}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1060,7 +1246,12 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
-    training_time_ms = 0.0
+    pretrain_overhead_ms = float(bigram_logit_stats["elapsed_ms"])
+    if distributed and pretrain_overhead_ms > 0.0:
+        overhead_tensor = torch.tensor(pretrain_overhead_ms, device=device)
+        dist.all_reduce(overhead_tensor, op=dist.ReduceOp.MAX)
+        pretrain_overhead_ms = float(overhead_tensor.item())
+    training_time_ms = pretrain_overhead_ms
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
