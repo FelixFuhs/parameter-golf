@@ -15,6 +15,7 @@ import random
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 import zlib
 from pathlib import Path
@@ -68,8 +69,9 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
     use_bigram_hash = int(os.environ.get("USE_BIGRAM_HASH", "0"))
-    bigram_table_size = int(os.environ.get("BIGRAM_TABLE_SIZE", 4096))
+    bigram_table_size = int(os.environ.get("BIGRAM_TABLE_SIZE", os.environ.get("BIGRAM_HASH_BUCKETS", 12288)))
     bigram_inject_layer = int(os.environ.get("BIGRAM_INJECT_LAYER", 1))
+    hash_enrich = os.environ.get("HASH_ENRICH", "none").strip().lower()
     use_bigram_logit_bias = bool(int(os.environ.get("USE_BIGRAM_LOGIT_BIAS", "0")))
     bigram_logit_alpha_init = float(os.environ.get("BIGRAM_LOGIT_ALPHA_INIT", 0.5))
     use_byte_features = bool(int(os.environ.get("USE_BYTE_FEATURES", "0")))
@@ -213,6 +215,21 @@ def build_sentencepiece_luts(
     )
 
 
+def sentencepiece_token_bytes_and_text(sp: spm.SentencePieceProcessor, token_id: int) -> tuple[bytes, str]:
+    if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
+        return b"", ""
+    if sp.is_byte(token_id):
+        piece = sp.id_to_piece(token_id)
+        if piece.startswith("<0x") and piece.endswith(">") and len(piece) == 6:
+            piece_bytes = bytes((int(piece[3:5], 16),))
+            return piece_bytes, piece_bytes.decode("utf-8", errors="ignore")
+        return b"", ""
+    piece = sp.id_to_piece(token_id)
+    if piece.startswith("▁"):
+        piece = " " + piece[1:]
+    return piece.encode("utf-8"), piece
+
+
 def build_sentencepiece_byte_feature_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, max_len: int
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -224,19 +241,7 @@ def build_sentencepiece_byte_feature_luts(
     last_byte_np = np.zeros((table_size,), dtype=np.int64)
     token_len_np = np.zeros((table_size,), dtype=np.int64)
     for token_id in range(sp_vocab_size):
-        if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
-            continue
-        if sp.is_byte(token_id):
-            piece = sp.id_to_piece(token_id)
-            if piece.startswith("<0x") and piece.endswith(">") and len(piece) == 6:
-                piece_bytes = bytes((int(piece[3:5], 16),))
-            else:
-                piece_bytes = b""
-        else:
-            piece = sp.id_to_piece(token_id)
-            if piece.startswith("▁"):
-                piece = " " + piece[1:]
-            piece_bytes = piece.encode("utf-8")
+        piece_bytes, _ = sentencepiece_token_bytes_and_text(sp, token_id)
         if piece_bytes:
             first_byte_np[token_id] = piece_bytes[0]
             last_byte_np[token_id] = piece_bytes[-1]
@@ -246,6 +251,33 @@ def build_sentencepiece_byte_feature_luts(
         torch.tensor(last_byte_np, dtype=torch.int64),
         torch.tensor(token_len_np, dtype=torch.int64),
     )
+
+
+def build_sentencepiece_hash_enrich_lut(
+    sp: spm.SentencePieceProcessor, vocab_size: int, mode: str
+) -> tuple[Tensor, int]:
+    mode = mode.strip().lower()
+    if mode not in {"none", "space", "punct", "upper", "length"}:
+        raise ValueError(f"HASH_ENRICH must be one of none, space, punct, upper, length; got {mode}")
+    sp_vocab_size = int(sp.vocab_size())
+    table_size = max(sp_vocab_size, vocab_size)
+    lut_np = np.zeros((table_size,), dtype=np.int32)
+    if mode == "none":
+        return torch.tensor(lut_np, dtype=torch.int32), 1
+    for token_id in range(sp_vocab_size):
+        piece_bytes, piece_text = sentencepiece_token_bytes_and_text(sp, token_id)
+        stripped = piece_text.lstrip(" ")
+        if mode == "space":
+            lut_np[token_id] = int(piece_bytes.startswith(b" "))
+        elif mode == "punct":
+            lut_np[token_id] = int(bool(stripped) and all(unicodedata.category(ch).startswith("P") for ch in stripped))
+        elif mode == "upper":
+            lut_np[token_id] = int(bool(stripped) and stripped[0].isupper())
+        elif mode == "length":
+            if piece_bytes:
+                byte_len = len(piece_bytes)
+                lut_np[token_id] = 1 if byte_len == 1 else 2 if byte_len == 2 else 3 if byte_len == 3 else 4
+    return torch.tensor(lut_np, dtype=torch.int32), (5 if mode == "length" else 2)
 
 
 def build_bigram_logit_bias(pattern: str, vocab_size: int) -> tuple[Tensor, dict[str, float | int]]:
@@ -705,12 +737,24 @@ class MLP(nn.Module):
 class BigramHash(nn.Module):
     # Top leaderboard variants usually keep a small projected bigram table (often 128d)
     # and inject it into the residual stream before or early in the transformer.
-    def __init__(self, table_size: int, model_dim: int):
+    def __init__(
+        self,
+        table_size: int,
+        model_dim: int,
+        hash_enrich: str,
+        hash_enrich_lut: Tensor,
+        hash_enrich_cardinality: int,
+    ):
         super().__init__()
         if table_size < 2:
             raise ValueError(f"bigram table_size must be at least 2, got {table_size}")
+        if hash_enrich_cardinality <= 0:
+            raise ValueError(f"hash_enrich_cardinality must be positive, got {hash_enrich_cardinality}")
         self.table_size = table_size
         self.hash_dim = min(128, model_dim)
+        self.hash_enrich = hash_enrich
+        self.hash_enrich_cardinality = hash_enrich_cardinality
+        self.register_buffer("hash_enrich_lut", hash_enrich_lut.to(dtype=torch.int32), persistent=False)
         self.table = nn.Embedding(table_size, self.hash_dim)
         self.proj = CastedLinear(self.hash_dim, model_dim, bias=False) if self.hash_dim != model_dim else None
         if self.proj is not None:
@@ -724,7 +768,11 @@ class BigramHash(nn.Module):
         mod = self.table_size - 1
         out = torch.empty_like(t)
         out[..., 0] = mod
-        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        pair_hash = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1])
+        if self.hash_enrich_cardinality > 1:
+            enrich = self.hash_enrich_lut[token_ids[..., 1:]].to(dtype=torch.int32)
+            pair_hash = pair_hash * self.hash_enrich_cardinality + enrich
+        out[..., 1:] = pair_hash % mod
         return out.long()
 
     def forward(self, token_ids: Tensor) -> Tensor:
@@ -809,6 +857,9 @@ class GPT(nn.Module):
         use_bigram_hash: int,
         bigram_table_size: int,
         bigram_inject_layer: int,
+        hash_enrich: str,
+        hash_enrich_lut: Tensor | None,
+        hash_enrich_cardinality: int,
         use_bigram_logit_bias: bool,
         bigram_logit_alpha_init: float,
         bigram_logit_bias: Tensor | None,
@@ -833,6 +884,8 @@ class GPT(nn.Module):
             raise ValueError(
                 f"BIGRAM_INJECT_LAYER must be in [0, {num_layers - 1}] when enabled, got {bigram_inject_layer}"
             )
+        if use_bigram_hash and hash_enrich_lut is None:
+            raise ValueError("hash_enrich_lut is required when USE_BIGRAM_HASH is enabled")
         if use_bigram_logit_bias and bigram_logit_bias is None:
             raise ValueError("bigram_logit_bias tensor is required when USE_BIGRAM_LOGIT_BIAS=1")
         if use_byte_features and (
@@ -844,8 +897,13 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.use_bigram_hash = use_bigram_hash
         self.bigram_inject_layer = bigram_inject_layer
+        self.hash_enrich = hash_enrich
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHash(bigram_table_size, model_dim) if use_bigram_hash else None
+        self.bigram = (
+            BigramHash(bigram_table_size, model_dim, hash_enrich, hash_enrich_lut, hash_enrich_cardinality)
+            if use_bigram_hash
+            else None
+        )
         self.byte_features = (
             ByteFeatures(
                 model_dim,
@@ -1044,9 +1102,15 @@ def main() -> None:
     byte_feature_first_lut = None
     byte_feature_last_lut = None
     byte_feature_len_lut = None
+    hash_enrich_lut = None
+    hash_enrich_cardinality = 1
     if args.use_byte_features:
         byte_feature_first_lut, byte_feature_last_lut, byte_feature_len_lut = build_sentencepiece_byte_feature_luts(
             sp, args.vocab_size, args.byte_feature_max_len
+        )
+    if args.use_bigram_hash:
+        hash_enrich_lut, hash_enrich_cardinality = build_sentencepiece_hash_enrich_lut(
+            sp, args.vocab_size, args.hash_enrich
         )
     bigram_logit_bias = None
     bigram_logit_stats: dict[str, float | int] = {"elapsed_ms": 0.0, "num_pairs": 0, "nonzero_entries": 0}
@@ -1071,6 +1135,9 @@ def main() -> None:
         use_bigram_hash=args.use_bigram_hash,
         bigram_table_size=args.bigram_table_size,
         bigram_inject_layer=args.bigram_inject_layer,
+        hash_enrich=args.hash_enrich,
+        hash_enrich_lut=hash_enrich_lut,
+        hash_enrich_cardinality=hash_enrich_cardinality,
         use_bigram_logit_bias=args.use_bigram_logit_bias,
         bigram_logit_alpha_init=args.bigram_logit_alpha_init,
         bigram_logit_bias=bigram_logit_bias,
@@ -1169,7 +1236,8 @@ def main() -> None:
         mode = "gated" if args.use_bigram_hash == 2 else "additive"
         log0(
             f"bigram_hash:mode={mode} table_size:{args.bigram_table_size} "
-            f"inject_layer:{args.bigram_inject_layer} hash_dim:{base_model.bigram.hash_dim if base_model.bigram is not None else 0}"
+            f"inject_layer:{args.bigram_inject_layer} hash_dim:{base_model.bigram.hash_dim if base_model.bigram is not None else 0} "
+            f"hash_enrich:{args.hash_enrich}"
         )
     if args.use_bigram_logit_bias:
         log0(
