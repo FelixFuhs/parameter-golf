@@ -69,3 +69,24 @@
 - **Expectation:** Estimated total compressed submission of about `15.35 MB`, still under the cap.
 - **Result:** Val bpb `1.3341` (pre-stop), `1.3353` (quantized roundtrip). Artifact size `14.84 MB`. Total compressed submission `14.89 MB`. `1181` steps in ~10 min.
 - **Learning:** The balanced middle ground did not win. It beat the older width-only and baseline-size runs, but both the simple `4096` BigramHash and especially the `12288` table-only scale-up were better.
+
+## #10a — Bigram Logit Bias on BigramHash 12288
+- **Change:** Keep additive BigramHash at `12288` buckets and add a fixed counts-derived bigram logit bias with a learned scalar `alpha`.
+- **Hypothesis:** A direct next-token bigram prior might complement the hashed residual bigram signal and beat the plain `12288`-bucket BigramHash run.
+- **Expectation:** Estimated total compressed submission of about `15.78 MB`, still under the cap but with much less headroom.
+- **Result:** Val bpb `1.3335` (pre-stop), `1.3352` (quantized roundtrip). Artifact size `14.91 MB`. Total compressed submission `14.97 MB`. `1161` steps in ~10 min. Bigram counting took about `8.0s`.
+- **Learning:** The fixed logit prior fit comfortably and beat several weaker mixed variants, but it did not beat the plain `12288`-bucket BigramHash baseline. The signal is useful, but not strong enough here to justify replacing the simpler best run.
+
+## #11 — Byte Features on BigramHash 12288
+- **Change:** Keep additive BigramHash at `12288` buckets and add learned `first_byte`, `last_byte`, and `token_length` features projected into the input stream.
+- **Hypothesis:** Cheap byte-level token-form features might improve compression by giving the model extra morphology and token-shape cues for very little size cost.
+- **Expectation:** Stay well under the size cap, with a small chance of improving over the plain `12288`-bucket BigramHash run.
+- **Result:** Val bpb `1.3474` (pre-stop), `1.3487` (quantized roundtrip). Artifact size `14.42 MB`. Total compressed submission `14.48 MB`. `1117` steps in ~10 min.
+- **Learning:** Byte features hurt. They started less stably, converged worse than every strong BigramHash run, and look like a distraction rather than a useful addition under the 10-minute budget.
+
+## #10b — Bigram Logit Bias + Byte Features
+- **Change:** Combine additive BigramHash at `12288` buckets with both the fixed bigram logit bias and the byte-feature input path.
+- **Hypothesis:** The fixed bigram prior and the token-form cues might be complementary and beat either feature family alone.
+- **Expectation:** Stay under the cap while at least matching the logit-bias-only run.
+- **Result:** Val bpb `1.3484` (pre-stop), `1.3506` (quantized roundtrip). Artifact size `14.84 MB`. Total compressed submission `14.90 MB`. `1121` steps in ~10 min. Bigram counting took about `8.3s`.
+- **Learning:** The combination was worse than the logit-bias-only run and much worse than the plain `12288` BigramHash best run. In this recipe, byte features appear to drag down the stronger statistical prior rather than complement it.
