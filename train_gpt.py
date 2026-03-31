@@ -72,6 +72,7 @@ class Hyperparameters:
     bigram_table_size = int(os.environ.get("BIGRAM_TABLE_SIZE", os.environ.get("BIGRAM_HASH_BUCKETS", 12288)))
     bigram_inject_layer = int(os.environ.get("BIGRAM_INJECT_LAYER", 1))
     hash_enrich = os.environ.get("HASH_ENRICH", "none").strip().lower()
+    use_trigram = bool(int(os.environ.get("USE_TRIGRAM", "0")))
     use_bigram_logit_bias = bool(int(os.environ.get("USE_BIGRAM_LOGIT_BIAS", "0")))
     bigram_logit_alpha_init = float(os.environ.get("BIGRAM_LOGIT_ALPHA_INIT", 0.5))
     use_byte_features = bool(int(os.environ.get("USE_BYTE_FEATURES", "0")))
@@ -741,6 +742,7 @@ class BigramHash(nn.Module):
         self,
         table_size: int,
         model_dim: int,
+        use_trigram: bool,
         hash_enrich: str,
         hash_enrich_lut: Tensor,
         hash_enrich_cardinality: int,
@@ -752,6 +754,7 @@ class BigramHash(nn.Module):
             raise ValueError(f"hash_enrich_cardinality must be positive, got {hash_enrich_cardinality}")
         self.table_size = table_size
         self.hash_dim = min(128, model_dim)
+        self.use_trigram = use_trigram
         self.hash_enrich = hash_enrich
         self.hash_enrich_cardinality = hash_enrich_cardinality
         self.register_buffer("hash_enrich_lut", hash_enrich_lut.to(dtype=torch.int32), persistent=False)
@@ -767,12 +770,24 @@ class BigramHash(nn.Module):
         t = token_ids.to(torch.int32)
         mod = self.table_size - 1
         out = torch.empty_like(t)
+        if self.use_trigram:
+            prev = torch.zeros_like(t)
+            prev[..., 1:] = t[..., :-1]
+            prev_prev = torch.zeros_like(t)
+            prev_prev[..., 2:] = t[..., :-2]
+            mixed = torch.bitwise_xor(36313 * t, 27191 * prev)
+            mixed = torch.bitwise_xor(mixed, 17431 * prev_prev)
+            if self.hash_enrich_cardinality > 1:
+                enrich = self.hash_enrich_lut[token_ids].to(dtype=torch.int32)
+                mixed = mixed * self.hash_enrich_cardinality + enrich
+            out[...] = mixed % mod
+            return out.long()
         out[..., 0] = mod
-        pair_hash = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1])
+        mixed = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1])
         if self.hash_enrich_cardinality > 1:
             enrich = self.hash_enrich_lut[token_ids[..., 1:]].to(dtype=torch.int32)
-            pair_hash = pair_hash * self.hash_enrich_cardinality + enrich
-        out[..., 1:] = pair_hash % mod
+            mixed = mixed * self.hash_enrich_cardinality + enrich
+        out[..., 1:] = mixed % mod
         return out.long()
 
     def forward(self, token_ids: Tensor) -> Tensor:
@@ -857,6 +872,7 @@ class GPT(nn.Module):
         use_bigram_hash: int,
         bigram_table_size: int,
         bigram_inject_layer: int,
+        use_trigram: bool,
         hash_enrich: str,
         hash_enrich_lut: Tensor | None,
         hash_enrich_cardinality: int,
@@ -897,10 +913,18 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.use_bigram_hash = use_bigram_hash
         self.bigram_inject_layer = bigram_inject_layer
+        self.use_trigram = use_trigram
         self.hash_enrich = hash_enrich
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = (
-            BigramHash(bigram_table_size, model_dim, hash_enrich, hash_enrich_lut, hash_enrich_cardinality)
+            BigramHash(
+                bigram_table_size,
+                model_dim,
+                use_trigram,
+                hash_enrich,
+                hash_enrich_lut,
+                hash_enrich_cardinality,
+            )
             if use_bigram_hash
             else None
         )
@@ -1135,6 +1159,7 @@ def main() -> None:
         use_bigram_hash=args.use_bigram_hash,
         bigram_table_size=args.bigram_table_size,
         bigram_inject_layer=args.bigram_inject_layer,
+        use_trigram=args.use_trigram,
         hash_enrich=args.hash_enrich,
         hash_enrich_lut=hash_enrich_lut,
         hash_enrich_cardinality=hash_enrich_cardinality,
@@ -1237,7 +1262,7 @@ def main() -> None:
         log0(
             f"bigram_hash:mode={mode} table_size:{args.bigram_table_size} "
             f"inject_layer:{args.bigram_inject_layer} hash_dim:{base_model.bigram.hash_dim if base_model.bigram is not None else 0} "
-            f"hash_enrich:{args.hash_enrich}"
+            f"hash_enrich:{args.hash_enrich} trigram:{int(args.use_trigram)}"
         )
     if args.use_bigram_logit_bias:
         log0(
