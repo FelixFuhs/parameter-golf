@@ -90,3 +90,52 @@
 - **Expectation:** Stay under the cap while at least matching the logit-bias-only run.
 - **Result:** Val bpb `1.3484` (pre-stop), `1.3506` (quantized roundtrip). Artifact size `14.84 MB`. Total compressed submission `14.90 MB`. `1121` steps in ~10 min. Bigram counting took about `8.3s`.
 - **Learning:** The combination was worse than the logit-bias-only run and much worse than the plain `12288` BigramHash best run. In this recipe, byte features appear to drag down the stronger statistical prior rather than complement it.
+
+## #12 — BigramHash 14336
+- **Change:** Increase additive BigramHash capacity from `12288` to `14336` buckets, keeping the baseline `512`-dim model and `HASH_ENRICH=none`.
+- **Hypothesis:** If more hashed local memory is still the strongest lever, another clean table-size increase might improve on the `12288`-bucket best run.
+- **Expectation:** Stay under the `16 MB` cap with a small chance of beating the `12288`-bucket run.
+- **Result:** Val bpb `1.3312` (pre-stop), `1.3324` (quantized roundtrip). Artifact size `14.85 MB`. Total compressed submission `14.92 MB`. `1189` steps in ~10 min.
+- **Learning:** Bigger was not better here. The larger table stayed under the cap, but it was clearly worse than the `12288`-bucket run, suggesting that raw bucket count alone is not the whole story.
+
+## #13 — Hash Enrich: Space
+- **Change:** Keep additive BigramHash at `12288` buckets and fold a binary `starts-with-space` feature of the current token into the hash key via `HASH_ENRICH=space`.
+- **Hypothesis:** Distinguishing word-initial tokens from non-initial tokens may reduce destructive hash collisions and make the same table encode more useful local structure.
+- **Expectation:** Same hot-path cost as plain BigramHash, with a real chance of improving on the `12288`-bucket best run.
+- **Result:** Val bpb `1.3150` (pre-stop), `1.3159` (quantized roundtrip). Artifact size `15.21 MB`. Total compressed submission `15.28 MB`. `1440` steps in ~10 min.
+- **Learning:** This was a major win. A single free tokenizer-derived bit dramatically improved the effectiveness of BigramHash and beat every earlier run without adding any new trainable path.
+
+## #14 — Hash Enrich: Punctuation
+- **Change:** Keep additive BigramHash at `12288` buckets and fold a binary `pure-punctuation token` feature into the hash key via `HASH_ENRICH=punct`.
+- **Hypothesis:** Separating punctuation transitions from word-piece transitions might improve local prediction quality at zero runtime cost.
+- **Expectation:** Similar size and step count to the plain `12288`-bucket run, with a modest chance of improvement.
+- **Result:** Val bpb `1.3295` (pre-stop), `1.3307` (quantized roundtrip). Artifact size `14.68 MB`. Total compressed submission `14.74 MB`. `1229` steps in ~10 min.
+- **Learning:** Punctuation enrichment did not help. It underperformed the plain `12288`-bucket run and was far behind the `space`-enriched variant, so punctuation appears to be a weak extra bit for this tokenizer/model pair.
+
+## #15 — Hash Enrich: Uppercase
+- **Change:** Keep additive BigramHash at `12288` buckets and fold a binary `starts-with-uppercase` feature into the hash key via `HASH_ENRICH=upper`.
+- **Hypothesis:** Case may separate proper nouns, sentence starts, and abbreviations in a way that gives the hashed memory cleaner local contexts.
+- **Expectation:** Same hot-path cost as `space`, with a chance to match or beat it if case is a stronger partitioning signal.
+- **Result:** Val bpb `1.3122` (pre-stop), `1.3132` (quantized roundtrip). Artifact size `15.28 MB`. Total compressed submission `15.34 MB`. `1430` steps in ~10 min.
+- **Learning:** This is the new best run so far. Case information turned out to be even more useful than the space bit, which strongly supports the idea that the next gains come from better hash addressing, not more neural compute.
+
+## #16 — Hash Enrich: Length Bucket
+- **Change:** Keep additive BigramHash at `12288` buckets and fold a 4-way token byte-length bucket into the hash key via `HASH_ENRICH=length`.
+- **Hypothesis:** Token length might give the hash table a cheap morphology proxy without adding any new module.
+- **Expectation:** A plausible middle ground between the weak punctuation bit and the stronger boundary-style bits.
+- **Result:** Val bpb `1.3288` (pre-stop), `1.3300` (quantized roundtrip). Artifact size `14.79 MB`. Total compressed submission `14.85 MB`. `1221` steps in ~10 min.
+- **Learning:** Length bucketing did not pay off. It landed near the punctuation result and far behind `space` and `upper`, so not all tokenizer-derived bits are equally valuable even when they are effectively free.
+
+## #17 — Inject Layer 0
+- **Change:** Keep additive BigramHash at `12288` buckets with `HASH_ENRICH=none`, but move the injection point from layer `1` to layer `0`.
+- **Hypothesis:** Injecting the hashed local signal before the first block might let the transformer use it more effectively throughout the stack.
+- **Expectation:** Similar size to the plain `12288`-bucket run, with a chance of better quality if earlier conditioning matters.
+- **Result:** Val bpb `1.3330` (pre-stop), `1.3343` (quantized roundtrip). Artifact size `14.46 MB`. Total compressed submission `14.52 MB`. `1191` steps in ~10 min.
+- **Learning:** Earlier injection was worse. The original layer-`1` insertion point remains clearly better, so the best local-memory signal still seems to be “early, but not earliest.”
+
+## #18 — Trigram Hash
+- **Change:** Keep the `12288`-bucket additive hash path, but change the bucket key from `(prev, curr)` to `(prev_prev, prev, curr)` with zero padding for missing history and `HASH_ENRICH=none`.
+- **Hypothesis:** More context in the same single lookup path might improve local memory without adding any new module or projection cost.
+- **Expectation:** Similar runtime and size to the plain `12288`-bucket run, with a chance to outperform it if trigram context is worth the extra collision pressure.
+- **Result:** Val bpb `1.3358` (pre-stop), `1.3370` (quantized roundtrip). Artifact size `14.83 MB`. Total compressed submission `14.89 MB`. `1198` steps in ~10 min.
+- **Learning:** Trigram hashing did not help. The extra context appears to make the fixed-size table less effective, likely by increasing collision pressure faster than the added history improves the signal.
