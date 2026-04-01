@@ -139,3 +139,17 @@
 - **Expectation:** Similar runtime and size to the plain `12288`-bucket run, with a chance to outperform it if trigram context is worth the extra collision pressure.
 - **Result:** Val bpb `1.3358` (pre-stop), `1.3370` (quantized roundtrip). Artifact size `14.83 MB`. Total compressed submission `14.89 MB`. `1198` steps in ~10 min.
 - **Learning:** Trigram hashing did not help. The extra context appears to make the fixed-size table less effective, likely by increasing collision pressure faster than the added history improves the signal.
+
+## #19 — Hash Enrich: Space + Upper (4-state)
+- **Change:** Keep additive BigramHash at `12288` buckets and fold a 4-state composite feature into the hash key via `HASH_ENRICH=space_upper`, where `feature = starts_with_space + 2 * starts_with_uppercase`.
+- **Hypothesis:** Combining the two strongest single-bit enrichments into one 2-bit address feature might outperform either `space` or `upper` alone while keeping the exact same hot-path cost.
+- **Expectation:** If the signals are complementary, this should beat the `upper`-only best run; if not, it may over-fragment the fixed table.
+- **Result:** Val bpb `1.3277` (pre-stop), `1.3288` (quantized roundtrip). Artifact size `14.86 MB`. Total compressed submission `14.93 MB`. `1257` steps in ~10 min.
+- **Learning:** The naive combination was clearly worse than both `upper` and `space` alone. Splitting the table into four address classes appears to fragment the available bucket capacity faster than the extra distinction helps.
+
+## #20 — Hash Enrich: New Word
+- **Change:** Because `space_upper` did not beat the `upper` baseline, run the conditional fallback `HASH_ENRICH=new_word`, where `new_word = starts_with_space OR (starts_with_uppercase AND prev_token_is_punctuation_or_BOS)`.
+- **Hypothesis:** A smarter composite boundary signal might capture the real benefit behind `upper` and `space` without paying the fragmentation penalty of the 4-state scheme.
+- **Expectation:** This should outperform the weaker enrichment variants and had an outside chance of matching `upper` if the true signal is “start of a fresh word/context.”
+- **Result:** Val bpb `1.3316` (pre-stop), `1.3327` (quantized roundtrip). Artifact size `14.73 MB`. Total compressed submission `14.81 MB`. `1224` steps in ~10 min.
+- **Learning:** The smarter boundary heuristic still lost to the plain `upper` bit. So far the best result comes from a very simple token-local partition, not a more linguistically motivated composite rule. `BIGRAM_COUNT_INIT` remains untested because the conditional branch never reached it.
