@@ -69,8 +69,17 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
     use_bigram_hash = int(os.environ.get("USE_BIGRAM_HASH", "0"))
-    bigram_table_size = int(os.environ.get("BIGRAM_TABLE_SIZE", os.environ.get("BIGRAM_HASH_BUCKETS", 12288)))
+    use_skip_bigram = bool(int(os.environ.get("USE_SKIP_BIGRAM", "0")))
+    bigram_table_size = int(
+        os.environ.get(
+            "BIGRAM_TABLE_SIZE",
+            os.environ.get("BIGRAM_HASH_BUCKETS", "6144" if use_skip_bigram else "12288"),
+        )
+    )
+    skip_bigram_size = int(os.environ.get("SKIP_BIGRAM_SIZE", 6144))
     bigram_inject_layer = int(os.environ.get("BIGRAM_INJECT_LAYER", 1))
+    bigram_multi_inject = bool(int(os.environ.get("BIGRAM_MULTI_INJECT", "0")))
+    bigram_reinject_layer = int(os.environ.get("BIGRAM_REINJECT_LAYER", 5))
     hash_enrich = os.environ.get("HASH_ENRICH", "none").strip().lower()
     bigram_count_init = bool(int(os.environ.get("BIGRAM_COUNT_INIT", "0")))
     use_trigram = bool(int(os.environ.get("USE_TRIGRAM", "0")))
@@ -98,6 +107,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    lr_scale = float(os.environ.get("LR_SCALE", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -819,6 +829,8 @@ class BigramHash(nn.Module):
         table_size: int,
         model_dim: int,
         use_trigram: bool,
+        history_stride: int,
+        reserve_initial_bucket: bool,
         hash_enrich: str,
         hash_enrich_lut: Tensor,
         hash_enrich_cardinality: int,
@@ -829,11 +841,15 @@ class BigramHash(nn.Module):
         super().__init__()
         if table_size < 2:
             raise ValueError(f"bigram table_size must be at least 2, got {table_size}")
+        if history_stride <= 0:
+            raise ValueError(f"history_stride must be positive, got {history_stride}")
         if hash_enrich_cardinality <= 0:
             raise ValueError(f"hash_enrich_cardinality must be positive, got {hash_enrich_cardinality}")
         self.table_size = table_size
         self.hash_dim = min(128, model_dim)
         self.use_trigram = use_trigram
+        self.history_stride = history_stride
+        self.reserve_initial_bucket = reserve_initial_bucket
         self.hash_enrich = hash_enrich
         self.hash_enrich_cardinality = hash_enrich_cardinality
         self.register_buffer("hash_enrich_lut", hash_enrich_lut.to(dtype=torch.int32), persistent=False)
@@ -867,8 +883,8 @@ class BigramHash(nn.Module):
         return (mixed % mod).long()
 
     def hash_ids(self, token_ids: Tensor) -> Tensor:
-        # Reserve the final bucket for the first position, then hash (prev, cur) pairs
-        # with the xor-style mixer used in several strong leaderboard entries.
+        # Main bigram mode reserves a dedicated first-position bucket, while skip/trigram
+        # modes zero-pad missing history and hash every position.
         t = token_ids.to(torch.int32)
         mod = self.table_size - 1
         out = torch.empty_like(t)
@@ -886,12 +902,26 @@ class BigramHash(nn.Module):
                 mixed = mixed * self.hash_enrich_cardinality + enrich
             out[...] = mixed % mod
             return out.long()
-        out[..., 0] = mod
-        mixed = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1])
+        prev = torch.zeros_like(t)
+        if t.size(-1) > self.history_stride:
+            prev[..., self.history_stride :] = t[..., : -self.history_stride]
+        if self.reserve_initial_bucket:
+            out[..., : self.history_stride] = mod
+            current_ids = token_ids[..., self.history_stride :]
+            prev_ids = token_ids[..., : -self.history_stride]
+            mixed = torch.bitwise_xor(36313 * t[..., self.history_stride :], 27191 * prev[..., self.history_stride :])
+            if self.hash_enrich_cardinality > 1:
+                enrich = self._enrich_values(current_ids, prev_ids, bos_mask=None)
+                mixed = mixed * self.hash_enrich_cardinality + enrich
+            out[..., self.history_stride :] = mixed % mod
+            return out.long()
+        mixed = torch.bitwise_xor(36313 * t, 27191 * prev)
         if self.hash_enrich_cardinality > 1:
-            enrich = self._enrich_values(token_ids[..., 1:], token_ids[..., :-1], bos_mask=None)
+            bos_mask = torch.zeros_like(t)
+            bos_mask[..., : self.history_stride] = 1
+            enrich = self._enrich_values(token_ids, token_ids.roll(1, dims=-1), bos_mask=bos_mask)
             mixed = mixed * self.hash_enrich_cardinality + enrich
-        out[..., 1:] = mixed % mod
+        out[...] = mixed % mod
         return out.long()
 
     def forward(self, token_ids: Tensor) -> Tensor:
@@ -975,7 +1005,11 @@ class GPT(nn.Module):
         use_swiglu: bool,
         use_bigram_hash: int,
         bigram_table_size: int,
+        use_skip_bigram: bool,
+        skip_bigram_size: int,
         bigram_inject_layer: int,
+        bigram_multi_inject: bool,
+        bigram_reinject_layer: int,
         use_trigram: bool,
         hash_enrich: str,
         hash_enrich_lut: Tensor | None,
@@ -1003,9 +1037,17 @@ class GPT(nn.Module):
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         if use_bigram_hash not in (0, 1, 2):
             raise ValueError(f"USE_BIGRAM_HASH must be 0, 1, or 2, got {use_bigram_hash}")
-        if use_bigram_hash and not (0 <= bigram_inject_layer < num_layers):
+        if use_skip_bigram and not use_bigram_hash:
+            raise ValueError("USE_SKIP_BIGRAM=1 requires USE_BIGRAM_HASH to be enabled")
+        if bigram_multi_inject and not use_bigram_hash:
+            raise ValueError("BIGRAM_MULTI_INJECT=1 requires USE_BIGRAM_HASH to be enabled")
+        if (use_bigram_hash or use_skip_bigram) and not (0 <= bigram_inject_layer < num_layers):
             raise ValueError(
                 f"BIGRAM_INJECT_LAYER must be in [0, {num_layers - 1}] when enabled, got {bigram_inject_layer}"
+            )
+        if bigram_multi_inject and not (0 <= bigram_reinject_layer < num_layers):
+            raise ValueError(
+                f"BIGRAM_REINJECT_LAYER must be in [0, {num_layers - 1}] when enabled, got {bigram_reinject_layer}"
             )
         if use_bigram_hash and hash_enrich_lut is None:
             raise ValueError("hash_enrich_lut is required when USE_BIGRAM_HASH is enabled")
@@ -1021,7 +1063,10 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.use_bigram_hash = use_bigram_hash
+        self.use_skip_bigram = use_skip_bigram
         self.bigram_inject_layer = bigram_inject_layer
+        self.bigram_multi_inject = bigram_multi_inject
+        self.bigram_reinject_layer = bigram_reinject_layer
         self.use_trigram = use_trigram
         self.hash_enrich = hash_enrich
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
@@ -1030,6 +1075,8 @@ class GPT(nn.Module):
                 bigram_table_size,
                 model_dim,
                 use_trigram,
+                1,
+                True,
                 hash_enrich,
                 hash_enrich_lut,
                 hash_enrich_cardinality,
@@ -1038,6 +1085,23 @@ class GPT(nn.Module):
                 hash_upper_lut,
             )
             if use_bigram_hash
+            else None
+        )
+        self.skip_bigram = (
+            BigramHash(
+                skip_bigram_size,
+                model_dim,
+                False,
+                2,
+                False,
+                hash_enrich,
+                hash_enrich_lut,
+                hash_enrich_cardinality,
+                hash_space_lut,
+                hash_punct_lut,
+                hash_upper_lut,
+            )
+            if use_skip_bigram
             else None
         )
         self.byte_features = (
@@ -1098,7 +1162,12 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def inject_bigram(self, x: Tensor, bigram_out: Tensor | None, layer_idx: int) -> Tensor:
-        if bigram_out is None or layer_idx != self.bigram_inject_layer:
+        if bigram_out is None:
+            return x
+        inject_here = layer_idx == self.bigram_inject_layer or (
+            self.bigram_multi_inject and layer_idx == self.bigram_reinject_layer
+        )
+        if not inject_here:
             return x
         if self.bigram_gates is not None:
             gate = torch.sigmoid(self.bigram_gates[layer_idx]).to(dtype=x.dtype)
@@ -1111,22 +1180,29 @@ class GPT(nn.Module):
             x = x + self.byte_features(input_ids).to(dtype=x.dtype)
         x = F.rms_norm(x, (x.size(-1),))
         bigram_out = self.bigram(input_ids) if self.bigram is not None else None
+        skip_bigram_out = self.skip_bigram(input_ids) if self.skip_bigram is not None else None
+        if bigram_out is None:
+            bigram_resid = skip_bigram_out
+        elif skip_bigram_out is None:
+            bigram_resid = bigram_out
+        else:
+            bigram_resid = bigram_out + skip_bigram_out.to(dtype=bigram_out.dtype)
         if self.bigram_inject_layer == 0:
-            x = self.inject_bigram(x, bigram_out, 0)
+            x = self.inject_bigram(x, bigram_resid, 0)
         x0 = x
         skips: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             if i != 0:
-                x = self.inject_bigram(x, bigram_out, i)
+                x = self.inject_bigram(x, bigram_resid, i)
             x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             block_idx = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.inject_bigram(x, bigram_out, block_idx)
+            x = self.inject_bigram(x, bigram_resid, block_idx)
             x = self.blocks[block_idx](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -1282,7 +1358,11 @@ def main() -> None:
         use_swiglu=args.use_swiglu,
         use_bigram_hash=args.use_bigram_hash,
         bigram_table_size=args.bigram_table_size,
+        use_skip_bigram=args.use_skip_bigram,
+        skip_bigram_size=args.skip_bigram_size,
         bigram_inject_layer=args.bigram_inject_layer,
+        bigram_multi_inject=args.bigram_multi_inject,
+        bigram_reinject_layer=args.bigram_reinject_layer,
         use_trigram=args.use_trigram,
         hash_enrich=args.hash_enrich,
         hash_enrich_lut=hash_enrich_lut,
@@ -1343,6 +1423,10 @@ def main() -> None:
             matrix_params.append(base_model.bigram.proj.weight)
         if base_model.bigram_gates is not None:
             scalar_params.append(base_model.bigram_gates)
+    if base_model.skip_bigram is not None:
+        token_params.append(base_model.skip_bigram.table.weight)
+        if base_model.skip_bigram.proj is not None:
+            matrix_params.append(base_model.skip_bigram.proj.weight)
     if base_model.bigram_logit_alpha is not None:
         scalar_params.append(base_model.bigram_logit_alpha)
     if base_model.byte_features is not None:
@@ -1354,7 +1438,10 @@ def main() -> None:
             ]
         )
         matrix_params.append(base_model.byte_features.proj.weight)
-    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    token_lr = (args.tied_embed_lr if args.tie_embeddings else args.embed_lr) * args.lr_scale
+    head_lr = args.head_lr * args.lr_scale
+    matrix_lr = args.matrix_lr * args.lr_scale
+    scalar_lr = args.scalar_lr * args.lr_scale
     optimizer_tok = torch.optim.Adam(
         [{"params": token_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1363,14 +1450,14 @@ def main() -> None:
     )
     optimizer_muon = Muon(
         matrix_params,
-        lr=args.matrix_lr,
+        lr=matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
     )
     for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
+        group["base_lr"] = matrix_lr
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        [{"params": scalar_params, "lr": scalar_lr, "base_lr": scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1378,7 +1465,7 @@ def main() -> None:
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            [{"params": [base_model.lm_head.weight], "lr": head_lr, "base_lr": head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -1397,6 +1484,13 @@ def main() -> None:
             f"inject_layer:{args.bigram_inject_layer} hash_dim:{base_model.bigram.hash_dim if base_model.bigram is not None else 0} "
             f"hash_enrich:{args.hash_enrich} trigram:{int(args.use_trigram)} count_init:{int(args.bigram_count_init)}"
         )
+    if args.use_skip_bigram:
+        log0(
+            f"skip_bigram:enabled table_size:{args.skip_bigram_size} inject_layer:{args.bigram_inject_layer} "
+            f"hash_dim:{base_model.skip_bigram.hash_dim if base_model.skip_bigram is not None else 0}"
+        )
+    if args.bigram_multi_inject:
+        log0(f"bigram_multi_inject:enabled reinject_layer:{args.bigram_reinject_layer}")
     if args.bigram_count_init:
         log0(
             f"bigram_count_init:enabled init_time:{bigram_count_init_stats['elapsed_ms']:.0f}ms "
@@ -1412,8 +1506,8 @@ def main() -> None:
         log0(f"byte_features:enabled dim:{args.byte_feature_dim} max_len:{args.byte_feature_max_len}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"head_lr:{head_lr if base_model.lm_head is not None else 0.0} "
+        f"matrix_lr:{matrix_lr} scalar_lr:{scalar_lr} lr_scale:{args.lr_scale}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
